@@ -18,8 +18,8 @@ Open your PyCharm project from the labs (the one with `ApiTCP_Python_NiryoOne`),
 
 2. This project:
 
-       git clone https://github.com/RoboticsT411/VisionSortingProject.git
-       cd VisionSortingProject
+       git clone https://github.com/RoboticsT411/VisionSortingMaster.git
+       cd VisionSortingMaster
 
    (Without git: unzip this folder into the project instead and `cd` into it.)
 
