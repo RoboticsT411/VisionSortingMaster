@@ -82,7 +82,7 @@ EDGE_MARGIN_MM = 10        # cubes closer than this to the zone edge are ignored
 KEEP_OUT_RADIUS_MM = 30    # no picking within this distance of squares A, B and C
 
 # ---------------------------------------------------------------- cubes
-CUBE_SIZE_MM = 25          # measure one of your cubes with a ruler and update
+CUBE_SIZE_MM = 20          # measure one of your cubes with a ruler and update
 # Every cube colour you have gets its own class, plus "other" for things that are
 # not cubes (paper, tape, a pen lid...). In step 2 each class has a number key.
 CLASS_KEYS = {
