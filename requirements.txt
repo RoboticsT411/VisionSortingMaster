@@ -1,7 +1,0 @@
-opencv-python>=4.8          # includes cv2.aruco; do not install opencv-contrib-python alongside it
-numpy
-scikit-learn>=1.2
-joblib
-matplotlib
-# niryo_one_tcp_client: from the ApiTCP_Python_NiryoOne folder you cloned in Section 3 of the lab manual
-# Optional extra (voice commands): pip install vosk sounddevice
