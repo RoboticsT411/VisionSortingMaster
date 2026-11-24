@@ -340,12 +340,14 @@ class MarkersWindow:
         if errors and max(errors.values()) > cfg.MAX_FIT_ERROR_MM and not messagebox.askyesno(
                 "Save", "Some readings are more than 5 mm from the fitted layout. Save anyway?"):
             return
+        corrected = cfg.MARKERS_FILE.exists() and "corrections" in json.loads(cfg.MARKERS_FILE.read_text())
         save_markers(readings, self.tilts, self.orientation)
         project_status(max_age=0)
         self.refresh()
         print(f"Saved {cfg.MARKERS_FILE}")
-        messagebox.showinfo("Saved", f"Saved to calibration/{cfg.MARKERS_FILE.name}.\n"
-                                     f"Next: python step1_check_calibration.py")
+        messagebox.showinfo("Saved", f"Saved to calibration/{cfg.MARKERS_FILE.name}.\n" +
+                            ("This replaces the correction made with F in step 1.5.\n" if corrected else "") +
+                            "Next: python step1_check_calibration.py")
 
     def quit(self):
         if self.robot is not None:
