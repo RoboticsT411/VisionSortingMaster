@@ -16,7 +16,9 @@ HOW IT WORKS
 1. Calibrate. Click the centre of A, then B, then C. The program finds the position and turn of
    the marker layout that puts your three clicks on your Lab 5 positions, and saves the robot
    x, y of each marker to calibration/markers.json. If the squares do not fit, it says why and
-   what to fix (usually one Lab 5 position, in step 1.1) and saves nothing.
+   saves nothing. If ONE square does not fit, its Lab 5 position is off: press U to move that
+   square's Lab 5 positions (all levels, pick-up and drop, heights unchanged) to where the
+   camera sees its centre. The calibration is then redone. A backup of the old file is kept.
 2. Confirm. The red circles now show your Lab 5 positions for A, B and C: each should sit in the
    centre of its square. Click A, B and C again: all within 5 mm and the step is done.
 3. Ruler checks (optional). Lines join the marker centres, labelled with their length in mm.
@@ -26,15 +28,22 @@ HOW IT WORKS
 
 All positions are robot coordinates (origin at the robot base, x forward, y to the robot's left).
 
+4. Robot test (optional, recommended after U). T, then A, B or C, then Y: the robot goes above
+   that square at the safe height and down to its PICK level 1 position. Answer Y or N: the result
+   is saved with your Lab 5 positions, as "Test" in step 1.1 does. Keep clear of the robot.
+
 Keys:  0-9 and .  type a ruler value     Enter = compare     Backspace = delete / redo last square
-       Esc = cancel     R = start the calibration again     C = clear ruler checks     Q = quit
+       Esc = cancel     R = start the calibration again     U = correct the square that does not fit
+       T = robot test     C = clear ruler checks     Q = quit (the robot goes to its sleep pose)
 Every comparison is saved to results/calibration_checks.csv.
 """
 import argparse
 import csv
 import json
 import math
+import queue
 import shutil
+import threading
 from datetime import datetime
 from itertools import combinations
 
@@ -44,7 +53,8 @@ import numpy as np
 import config as cfg
 from aruco_view import MarkerDetector, TopDownView
 from camera import Camera
-from robot import load_lab5_poses, square_centres
+from robot import (LEVELS, check_pose, load_lab5_poses, read_lab5_file, safe_height, save_lab5_file,
+                   square_centres)
 from progress import project_status, with_progress
 from ui import instruction_box
 
@@ -189,12 +199,42 @@ def place_layout(lab5, clicked):
             # Two squares can always be matched by turning far enough, so only a square-on turn counts
             if (max(left2) <= FIT_MM and abs(turn_deg(R2)) <= MAX_TURN_DEG and miss > TOLERANCE_MM
                     and (best is None or miss > best[1])):
-                best = (odd, miss)
+                best = (odd, miss, R2, t2)
         if best:
-            out.update(case="one_square", odd=best[0], odd_mm=best[1])
+            odd, miss, R2, t2 = best
+            # Where the camera sees the centre of the odd square, in robot coordinates
+            seen = R2 @ np.asarray(clicked[odd]) + t2
+            out.update(case="one_square", odd=odd, odd_mm=miss, R_rest=R2, t_rest=t2, odd_seen=seen,
+                       odd_shift_mm=(seen - np.asarray(lab5[odd])) * 1000)
         else:
             out["case"] = "inconsistent"
     return out
+
+
+def correct_lab5_square(name, shift_m):
+    """Move every pick-up and drop position of one square by shift_m (x, y; heights unchanged),
+    keep a backup of the old file, and clear that square's test results. Returns the backup name."""
+    data = read_lab5_file()
+    for kind in ("pick", "drop"):
+        for lv in LEVELS:
+            p = data[kind][name][lv]
+            new = [round(p[0] + float(shift_m[0]), 4), round(p[1] + float(shift_m[1]), 4), p[2]]
+            check_pose(new + list(data["orientation"]), {"pick": data["pick"], "drop": data["drop"]})
+            data[kind][name][lv] = new
+    for lv in LEVELS:
+        for kind in ("pick", "drop"):
+            data["tested"].pop(f"{kind} {name} {lv}", None)        # changed, so not tested any more
+    backup = f"lab5_positions_backup_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    shutil.copy(cfg.LAB5_FILE, cfg.CALIB_DIR / backup)
+    save_lab5_file(data)
+    return backup
+
+
+def record_test(name, ok):
+    """Store a robot test result for PICK name level 1, as step1_lab5_positions.py does."""
+    data = read_lab5_file()
+    data["tested"][f"pick {name} 1"] = "ok" if ok else "wrong"
+    save_lab5_file(data)
 
 
 def save_markers(placement, clicked):
@@ -210,6 +250,8 @@ def save_markers(placement, clicked):
             "placement": {"turn_deg": round(placement["turn"], 2), "shift_mm": [round(float(v) * 1000, 1) for v in t]},
             "fit_mm": {n: round(float(v), 1) for n, v in placement["left"].items()},
             "squares_clicked_on_layout_mm": {n: [round(float(v) * 1000, 1) for v in xy] for n, xy in clicked.items()},
+            "lab5_level1": {n: [round(float(v), 4) for v in xy] for n, xy in
+                            square_centres(load_lab5_poses()).items()},       # progress.py: changed since?
             "check": None}
     cfg.MARKERS_FILE.write_text(json.dumps(data, indent=2))
     project_status(max_age=0)
@@ -238,6 +280,61 @@ def load_saved_markers():
 
 
 # ======================================================================================
+# Robot test of one square (as "Test" in step1_lab5_positions.py), in its own thread
+# ======================================================================================
+class RobotTest(threading.Thread):
+    """Connect once, then on request: go above a square at the safe height, down to its level-1
+    pick-up position, wait for your answer, and go back up."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.commands = queue.Queue()
+        self.state = "connecting"      # connecting / ready / moving / arrived / failed / closed
+        self.status = "Connecting and calibrating the robot (about 30 s)..."
+        self.robot = None
+
+    def run(self):
+        try:
+            from robot import NiryoRobot
+            self.robot = NiryoRobot()
+            self.robot.start()
+            self.state, self.status = "ready", f"Robot {self.robot.ip} ready"
+        except BaseException as e:                       # NiryoRobot.start() raises SystemExit on failure
+            self.state = "failed"
+            self.status = "Could not connect: " + str(e).strip().splitlines()[0][:90]
+            return
+        while True:
+            cmd = self.commands.get()
+            try:
+                if cmd[0] == "test":
+                    _, name, pose, z_safe = cmd
+                    self.state, self.status = "moving", f"Moving to square {name}..."
+                    self.robot.learning_mode(False)
+                    self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
+                    self.robot.move_pose(pose)
+                    self.state, self.status = "arrived", f"Gripper at PICK {name} level 1"
+                elif cmd[0] == "up":
+                    _, pose, z_safe = cmd
+                    self.state, self.status = "moving", "Moving back up..."
+                    self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
+                    self.state, self.status = "ready", f"Robot {self.robot.ip} ready"
+                elif cmd[0] == "quit":
+                    self.robot.finish()
+                    self.state = "closed"
+                    return
+            except Exception as e:
+                self.state, self.status = "ready", f"Move failed: {e}"
+
+    def send(self, *cmd):
+        self.commands.put(cmd)
+
+    def close(self):
+        if self.state not in ("failed", "closed", "connecting") and self.is_alive():
+            self.send("quit")
+            self.join(timeout=30)
+
+
+# ======================================================================================
 # What the instruction box says
 # ======================================================================================
 def placement_box(p):
@@ -246,13 +343,14 @@ def placement_box(p):
     keys = "R = click A, B, C again    Q = quit"
     if p["case"] == "one_square":
         n = p["odd"]
-        return (f"Not calibrated: square {n} does not fit with the others ({p['odd_mm']:.1f} mm)", RED,
+        dx, dy = p["odd_shift_mm"]
+        return (f"Square {n} does not fit with the others: its Lab 5 position is {p['odd_mm']:.1f} mm off", RED,
                 [f"The other squares fit the marker layout; {n} does not. So {n}'s Lab 5 position (step 1.1) is not",
                  f"in the centre of {n}: the gripper was off-centre when it was recorded, or a number was mistyped.",
-                 f"(Or your click on {n} was off: press R and click again.)",
-                 f"FIX: python step1_lab5_positions.py -> select PICK {n} level 1 -> Test. If the gripper is off-centre,",
-                 f"move it by hand over the centre of {n}, press Read robot position, Save. Then run this step again.",
-                 keys])
+                 f"Green circle = where the camera sees the centre of {n}; red circle = your Lab 5 position for {n}.",
+                 f"FIX HERE:  U = move {n}'s Lab 5 positions to the green circle (x {dx:+.1f} mm, y {dy:+.1f} mm,",
+                 "           all levels, pick-up and drop; heights unchanged). The calibration is then redone.",
+                 f"If your click on {n} was off instead: R = click A, B, C again.    Q = quit"])
     if p["case"] == "turned":
         return (f"Not calibrated: the layout would have to turn {p['turn']:.0f} deg to fit", RED,
                 ["The platform is square to the robot, so this means the markers do not match MARKER_LAYOUT_MM in",
@@ -300,6 +398,9 @@ def main():
     square_px = {}                   # name -> pixel used in this round: the hole centre, or the click
     clicked_px = {}                  # name -> where you actually clicked, when it was moved to the hole
     missed = {}                      # name -> 1 after a click where the hole was not found
+    clicked_layout = {}              # the calibration clicks, on the marker layout (kept for U)
+    tester = None                    # RobotTest, once T has been used
+    test = None                      # robot test in progress: {"step": choose/confirm/sent/answer, "name": ...}
     placement = None                 # result of the calibration round
     off_mm = {}                      # confirmation: distance of each click from its Lab 5 position
     last_shown = None
@@ -352,6 +453,7 @@ def main():
                     continue
                 if stage == "calibrate":                     # all three clicked: place the layout
                     clicked = {n: np.array(layout_view.camera_to_robot(*square_px[n])) for n in squares}
+                    clicked_layout = clicked
                     placement = place_layout(squares, clicked)
                     print(f"Calibration: {placement['case']}, fit "
                           + ", ".join(f"{n} {v:.1f} mm" for n, v in placement["left"].items())
@@ -443,6 +545,17 @@ def main():
                                   for dx, dy in ((-1, -1), (-1, 1), (1, 1), (1, -1))]
                     cv2.polylines(shown, [np.int32(corners_px)], True, GREEN, 1, cv2.LINE_AA)
                 cv2.drawMarker(shown, (int(cx), int(cy)), BLUE, cv2.MARKER_CROSS, 18, 2)
+            if stage == "failed" and placement and placement["case"] == "one_square":
+                Rr, tr = placement["R_rest"], placement["t_rest"]
+                for name, xy in squares.items():                 # Lab 5 positions, placed with the other squares
+                    lx, ly = Rr.T @ (np.asarray(xy) - tr)
+                    px, py = layout_view.robot_to_camera(lx, ly)
+                    cv2.circle(shown, (int(px), int(py)), 9, RED, 2)
+                    put(shown, name, (px + 10, py - 10), RED, 0.6)
+                odd = placement["odd"]
+                gx, gy = square_px[odd]
+                cv2.circle(shown, (int(gx), int(gy)), 13, GREEN, 3, cv2.LINE_AA)
+                put(shown, f"{odd} here", (gx + 16, gy + 26), GREEN, 0.6)
             if stage == "done" and robot_view is not None:
                 for name, d in off_mm.items():
                     xy = robot_view.robot_to_camera(*squares[name])
@@ -458,6 +571,27 @@ def main():
             title, colour = f"Markers not found ({seen}/4) - clicks are ignored", RED
             lines = ["Check the focus and that nothing hides a marker, or run step1_tune_camera.py again.",
                      "Q = quit"]
+        elif test is not None:
+            colour = ORANGE
+            if test["step"] == "choose":
+                title = "Robot test: which square? Press A, B or C"
+                lines = ["The robot goes above that square at the safe height, then down to its PICK level 1 position,",
+                         "so you can see whether the gripper is centred over it.    Esc = cancel"]
+            elif test["step"] == "confirm":
+                n, pose = test["name"], test["pose"]
+                title = f"Robot test of square {n}: press Y to move, N to cancel"
+                lines = [f"The robot moves above {n} at z = {test['z_safe']:.3f} m, then down to x = {pose[0]:.3f}, "
+                         f"y = {pose[1]:.3f}, z = {pose[2]:.3f}.",
+                         "KEEP CLEAR OF THE ROBOT. Close every other program connected to it first.",
+                         "Y = move    N = cancel"]
+            elif tester is not None and tester.state == "arrived":
+                n = test["name"]
+                title, colour = f"Is the gripper centred over square {n}?  Y = yes, N = no", BLUE
+                lines = ["Look from the front and from the side: the closed fingers should be over the centre of the hole.",
+                         "The answer is saved with your Lab 5 positions, as in step 1.1. Then the robot goes back up."]
+            else:
+                title = f"Robot test of square {test['name']}"
+                lines = [tester.status if tester else "", "Please wait."]
         elif selected is not None:
             what = "the two points" if selected == "free" else f"marker {selected[0]} to {selected[1]}"
             title, colour = f"Type your ruler value for {what}, then press Enter", ORANGE
@@ -495,7 +629,8 @@ def main():
                 title, colour = f"Camera calibrated: {offs}", GREEN
                 lines = ["Saved. Next step: python step2_collect_data.py",
                          "Optional ruler checks: click a line between two markers (or two points), measure it with",
-                         "a ruler, type the value, Enter.    R = calibrate again    Q = quit"]
+                         "a ruler, type the value, Enter.    T = test a square with the robot",
+                         "R = calibrate again    Q = quit"]
             else:
                 title, colour = f"Not confirmed: {offs}", RED
                 lines = ["Your second clicks do not agree with the first ones within 5 mm.",
@@ -503,6 +638,10 @@ def main():
                          "Q = quit"]
             if message and message_colour in (GREEN, RED):
                 lines = [message] + lines
+        if test is None and message and message_colour == GREEN and stage == "confirm":
+            lines = [message] + lines
+        if tester is not None and test is None and tester.state == "failed":
+            lines = lines + [tester.status]
         shown = instruction_box(with_progress(shown, "1.5"), title, lines, colour)
 
         panel_offset[0] = shown.shape[0] - frame.shape[0]
@@ -516,6 +655,34 @@ def main():
         if key == 255:
             continue
         char = chr(key)
+        if test is not None:                                             # robot test keys come first
+            if (key == 27 and test["step"] in ("choose", "confirm")) or (test["step"] == "confirm" and char in "nN"):
+                test = None
+            elif test["step"] == "choose" and char.upper() in squares:
+                name = char.upper()
+                poses = load_lab5_poses()
+                pose = list(poses["pick"][name][1]) + list(poses["rpy"])
+                try:
+                    for p_ in ([pose[0], pose[1], poses["z_safe"]] + pose[3:], pose):
+                        check_pose(p_, poses)
+                    test = {"step": "confirm", "name": name, "pose": pose, "z_safe": poses["z_safe"]}
+                except ValueError as e:
+                    message, message_colour, test = str(e), RED, None
+            elif test["step"] == "confirm" and char in "yY":
+                if tester is None or tester.state == "failed":
+                    tester = RobotTest()
+                    tester.start()
+                tester.send("test", test["name"], test["pose"], test["z_safe"])
+                test["step"] = "sent"
+            elif test["step"] == "sent" and tester.state == "arrived" and char in "yYnN":
+                ok = char in "yY"
+                record_test(test["name"], ok)
+                tester.send("up", test["pose"], test["z_safe"])
+                message = (f"Square {test['name']}: robot test OK (saved with your Lab 5 positions)." if ok else
+                           f"Square {test['name']}: the gripper was NOT centred. R = calibrate again and click "
+                           f"{test['name']} carefully; if it repeats, correct {test['name']} by hand in step 1.1.")
+                message_colour, test = (GREEN if ok else RED), None
+            continue
         if selected is not None and (char.isdigit() or char == "."):
             typed += char
         elif selected is not None and key in (8, 127):
@@ -548,6 +715,30 @@ def main():
             square_px.pop(last)
             clicked_px.pop(last, None)
             square_queue.insert(0, last)
+        elif char in "tT" and squares and stage != "calibrate":
+            test = {"step": "choose"}
+            message = None
+        elif (char in "uU" and stage == "failed" and placement and placement["case"] == "one_square"):
+            odd = placement["odd"]
+            shift = placement["odd_shift_mm"] / 1000
+            try:
+                backup = correct_lab5_square(odd, shift)
+            except ValueError as e:
+                message, message_colour = f"Not changed: {e}", RED
+                continue
+            squares = {s_: np.array(xy) for s_, xy in square_centres(load_lab5_poses()).items()}
+            placement = place_layout(squares, clicked_layout)
+            print(f"Square {odd}: Lab 5 positions moved by x {shift[0] * 1000:+.1f} mm, y {shift[1] * 1000:+.1f} mm "
+                  f"(old file kept as calibration/{backup}); calibration: {placement['case']}")
+            if placement["case"] == "good":
+                markers = save_markers(placement, clicked_layout)
+                robot_view = TopDownView(markers)
+                robot_view.update(centres)
+                stage, square_queue, square_px = "confirm", list(squares), {}
+                clicked_px.clear()
+                message, message_colour = (f"Square {odd}'s Lab 5 positions moved by x {shift[0] * 1000:+.1f}, "
+                                           f"y {shift[1] * 1000:+.1f} mm and calibrated. After confirming, "
+                                           f"T = test {odd} with the robot (recommended).", GREEN)
         elif char in "rR" and squares:
             stage, square_queue, square_px, off_mm, placement = "calibrate", list(squares), {}, {}, None
             clicked_px.clear()
@@ -558,6 +749,9 @@ def main():
             message, message_colour = None, BLUE
         elif char in "qQ":
             break
+    if tester is not None:
+        print("Closing the robot connection (sleep pose)...")
+        tester.close()
     cam.release()
     cv2.destroyAllWindows()
     return last_shown

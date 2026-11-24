@@ -31,6 +31,17 @@ def _trials():
     return dry, len(rows) - dry
 
 
+def _lab5_changed_since(snapshot):
+    """True if the level-1 pick-up x, y of A, B or C moved since the calibration (test results don't count)."""
+    if not snapshot or not cfg.LAB5_FILE.exists():
+        return False
+    try:
+        pick = json.loads(cfg.LAB5_FILE.read_text())["pick"]
+        return any(abs(pick[sq]["1"][i] - snapshot[sq][i]) > 0.0005 for sq in snapshot for i in (0, 1))
+    except (ValueError, KeyError, TypeError, IndexError):
+        return True
+
+
 def _calibration():
     """Done when step1_check_calibration.py confirmed the calibration (A, B, C all within 5 mm)
     and the Lab 5 positions have not been changed since."""
@@ -42,7 +53,7 @@ def _calibration():
         return False, "", False
     if not check:
         return False, "not confirmed yet", True
-    if cfg.LAB5_FILE.exists() and cfg.LAB5_FILE.stat().st_mtime > cfg.MARKERS_FILE.stat().st_mtime:
+    if _lab5_changed_since(json.loads(cfg.MARKERS_FILE.read_text()).get("lab5_level1")):
         return False, "Lab 5 changed: calibrate again", True
     worst = max(check.get("off_mm", {0: 0}).values())
     return bool(check.get("passed")), f"worst {worst:.1f} mm", True
