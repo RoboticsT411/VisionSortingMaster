@@ -356,6 +356,7 @@ class NiryoRobot:
     def finish(self):
         """Go to the sleep pose and release the motors."""
         try:
+            self.client.set_learning_mode(False)          # it may be resting in learning mode
             self.client.move_joints(*cfg.SLEEP_JOINTS)
             self.client.set_learning_mode(True)
         finally:

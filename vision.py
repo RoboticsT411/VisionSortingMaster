@@ -119,7 +119,8 @@ class VisionSystem:
             return cam, None
 
         top = result.topdown.copy()
-        contours, _ = cv2.findContours(self.view.zone_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # RETR_LIST: the outer edge and the holes (the circles round A, B and C inside the zone)
+        contours, _ = cv2.findContours(self.view.zone_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(top, contours, -1, (255, 255, 255), 1)
         # The same pick-zone outline on the camera picture: put cubes inside it.
         for c in contours:

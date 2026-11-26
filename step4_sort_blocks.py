@@ -6,24 +6,31 @@ KEY PARTS: two functions in this file (marked "KEY PART"):
   pick_and_drop()  - the robot moves for one cube, based on the Lab 5 program
 Around them: the camera, the loop, the safety checks and the log.
 
-ALWAYS start with a dry run (the robot does not move, commands are printed):
-    python step4_sort_blocks.py --dry-run
-
-Then with the robot, confirming every move:
+Run it (with the robot, confirming every move):
     python step4_sort_blocks.py
 
 Options:
     --stacks 0,0,0   cubes already on A,B,C at the start (default none)
     --auto           do not ask before each move (only after supervised runs work)
-    --source PATH    use saved images instead of the camera (dry run only)
     --measure-offset after each pick, type how far (mm) the gripper was from the cube centre:
                      compare with and without USE_PARALLAX_CORRECTION (config.py)
     --voice          OPTIONAL EXTRA: voice commands (see voice_commands.py)
 
-Each cycle: arm to the observe pose -> fresh picture -> choose() -> your
-pick_and_drop() is first run on a RECORDER that checks every pose and the order
-of the moves -> only if everything passes does the real robot repeat it.
+Each cycle: arm to the observe pose (sleep pose, learning mode on, out of the camera's way) ->
+fresh picture -> choose() -> your pick_and_drop() is first run on a RECORDER that checks every
+pose and the order of the moves -> only if everything passes does the real robot repeat it ->
+back to the sleep pose, learning mode on.
 Every attempt is logged in results/trials.csv for your success rate.
+
+GUIDED PICKS (the first GUIDED_PICKS of every run, config.py): the robot stops 20 mm above the
+cube. Centre the gripper, one thing at a time, ENTER after each: 1 move it over the middle of the cube (D/A = your
+right/left, W/S = away from you/towards you), 2 turn it to line up (LEFT/RIGHT arrows), 3 it goes
+down and you check the height (UP/DOWN arrows); ENTER closes the gripper. Esc = stop. 4 it stops
+5 mm above the drop position: W/A/S/D, ENTER = let go; a change is saved to the Lab 5 DROP position
+of that square and level (a backup of the old file is kept; pick positions are not changed).
+The pick correction is saved after every guided pick (running average). The average of these corrections is saved in
+calibration/pick_correction.json and applied to every later pick (and to the next runs). Every
+correction is logged in results/pick_corrections.csv.
 
 The box at the top of the camera window says what the program is doing and
 what to answer. You answer in the PyCharm Run window (click in it first).
@@ -34,7 +41,9 @@ its power supply.
 """
 import argparse
 import csv
+import json
 import math
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -44,7 +53,8 @@ import cv2
 import config as cfg
 from camera import Camera
 from colour_model import ColourModel
-from robot import DryRunRobot, NiryoRobot, PlanRecorder, _rotation, load_lab5_poses, turned_rpy
+from robot import (DryRunRobot, NiryoRobot, PlanRecorder, _rotation, check_pose, load_lab5_poses, read_lab5_file,
+                   save_lab5_file, turned_rpy)
 from progress import print_progress, with_progress
 from ui import BLUE, GREEN, ORANGE, RED, instruction_box
 from vision import VisionSystem, show
@@ -176,7 +186,10 @@ def review_moves(steps, cube, poses, square, level, tol=0.005):
 # =====================================================================================
 # Given: the sorting loop
 # =====================================================================================
-CURRENT_STEP = ["4:Dry run"]
+CURRENT_STEP = ["4:Robot trials"]
+GUIDED_MAX_DEG = getattr(cfg, "GUIDED_MAX_DEG", 30)    # in case config.py is older than this file
+GUIDED_DROP_HOVER_MM = getattr(cfg, "GUIDED_DROP_HOVER_MM", 5)
+VERSION = "26 Nov 2026 12:55 (guided picks in 3 steps: move, turn with arrows, height)"
 
 
 def show_status(cam_img, title, lines, colour, refresh=True):
@@ -192,16 +205,16 @@ def show_status(cam_img, title, lines, colour, refresh=True):
 KEY_NAMES = {"\r": "Enter", " ": "Space"}
 
 
-def ask(prompt, auto, cam_img=None, title=None, lines=None, colour=BLUE, keys="\rsq"):
+def ask(prompt, auto, cam_img=None, title=None, lines=None, colour=BLUE, keys="\rsq", keys_line=None):
     """Wait for a key pressed IN THE CAMERA WINDOW, keeping the window alive (no "Not Responding").
-    Returns "" for Enter, otherwise the letter."""
+    Returns "" for Enter, otherwise the letter. keys_line replaces the list of keys at the bottom."""
     if auto:
         return ""
     print(prompt + " (press the key in the camera window)")
     while True:
         if cam_img is not None:
-            show_status(cam_img, title or prompt, (lines or []) + ["Click on the camera window, then press: " +
-                        ", ".join(KEY_NAMES.get(k, k.upper()) for k in keys)], colour, refresh=False)
+            show_status(cam_img, title or prompt, (lines or []) + [
+                keys_line or "(Click on the camera window first, then press the key.)"], colour, refresh=False)
         key = cv2.waitKey(50) & 0xFF
         if key == 255:
             continue
@@ -271,6 +284,351 @@ def while_busy(action, robot, cam_img, title, lines):
         raise box["error"]
 
 
+# =====================================================================================
+# Given: resting the arm, guided picks and the learned pick correction
+# =====================================================================================
+def rest(r):
+    """Sleep pose, then learning mode on: the arm is out of the camera's way."""
+    r.move_joints(cfg.SLEEP_JOINTS)
+    r.learning_mode(True)
+
+
+def run_steps(steps, poses, then_rest=False):
+    """An action for while_busy(): send these recorded steps to the robot (motors on first)."""
+    plan = PlanRecorder(poses)
+    plan.steps = list(steps)
+
+    def action(r):
+        r.learning_mode(False)
+        plan.replay(r)
+        if then_rest:
+            rest(r)
+    return action
+
+
+def load_pick_correction():
+    """{"dx_mm", "dy_mm", "dz_mm", ...} saved by earlier guided picks, or zeros."""
+    zero = {"dx_mm": 0.0, "dy_mm": 0.0, "dz_mm": 0.0, "turn_deg": 0.0, "picks": 0}
+    try:
+        data = json.loads(cfg.PICK_CORRECTION_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return zero
+    if data.get("parallax_corrected") != cfg.USE_PARALLAX_CORRECTION:
+        print("Pick correction not used: it was measured with USE_PARALLAX_CORRECTION = "
+              f"{data.get('parallax_corrected')}. The guided picks measure it again.")
+        return zero
+    return {**zero, **data}
+
+
+def save_pick_correction(old, corrections, angles):
+    """Save the average TOTAL correction (what was applied + what you changed) of this run's guided
+    picks, combined with the one saved by earlier runs (counted as up to 5 picks).
+    corrections: total (dx, dy, dz mm, turn deg) per guided pick; angles: the cube angle the camera saw."""
+    n = len(corrections)
+    w = min(old.get("picks", 0), 5)
+    prev = [old["dx_mm"], old["dy_mm"], old["dz_mm"], old["turn_deg"]]
+    mean = [(w * prev[i] + sum(c[i] for c in corrections)) / (w + n) for i in range(4)]
+    # Does the turn correction depend on the cube angle? A slope near -2 means the gripper turns the
+    # wrong way (YAW_SIGN); near 0 means a constant offset, which the average fixes.
+    slope = None
+    if n >= 3 and max(angles) - min(angles) >= 20:
+        ma = sum(angles) / n
+        slope = (sum((a - ma) * (c[3] - mean[3]) for a, c in zip(angles, corrections))
+                 / sum((a - ma) ** 2 for a in angles))
+    spread = max(math.hypot(c[0] - mean[0], c[1] - mean[1]) for c in corrections)
+    data = {"time": datetime.now().isoformat(timespec="seconds"),
+            "dx_mm": round(mean[0], 1), "dy_mm": round(mean[1], 1),
+            "dz_mm": round(mean[2], 1), "turn_deg": round(mean[3], 1),
+            "picks": w + n, "turn_vs_angle_slope": None if slope is None else round(slope, 2),
+            "spread_mm": round(spread, 1), "parallax_corrected": cfg.USE_PARALLAX_CORRECTION}
+    cfg.CALIB_DIR.mkdir(exist_ok=True)
+    cfg.PICK_CORRECTION_FILE.write_text(json.dumps(data, indent=2))
+    return data, spread, slope
+
+
+ARROWS = {2424832: "left", 2555904: "right", 2490368: "up", 2621440: "down",      # Windows
+          65361: "left", 65363: "right", 65362: "up", 65364: "down",              # Linux
+          63234: "left", 63235: "right", 63232: "up", 63233: "down"}              # macOS
+
+
+def ask_step(picture, title, lines, allowed, hint):
+    """One guided step: only the keys in allowed work ("left", "right", "up", "down", "enter", "esc"
+    or letters). Any other key shows the hint. Returns the key's name."""
+    note = ""
+    print(title)
+    while True:
+        show_status(picture, title, lines + ([note] if note else []), ORANGE if note else BLUE, refresh=False)
+        key = cv2.waitKeyEx(50)
+        if key == -1:
+            continue
+        if key in ARROWS:
+            name = ARROWS[key]
+        elif key & 0xFF in (10, 13):
+            name = "enter"
+        elif key & 0xFF == 27:
+            name = "esc"
+        else:
+            name = chr(key & 0xFF).lower()
+        if name in allowed:
+            return name
+        note = "- That key does nothing here. " + hint
+
+
+def guided_pick(recorder, robot, cube, poses, picture, target, which, square, level):
+    """Replay the recorded moves, but stop above the cube and at the grip height for corrections,
+    one thing at a time: 1 move sideways, 2 turn, 3 height; then 4 above the drop position (sideways).
+    which: e.g. "Guided pick 2 of 5". A drop correction is saved to the Lab 5 positions of that
+    square and level (drop only; a backup of the old file is kept).
+    Returns (dx, dy, dz in mm, turn in degrees), "stop" if the student pressed Esc, or None if the
+    moves have no descent to the cube followed by close_gripper() (then the caller replays normally)."""
+    steps = with_drop_turn(recorder.steps, square, level)
+    k = next((i for i, s_ in enumerate(steps) if s_[0] == "move" and s_[1][2] < poses["z_safe"] - 0.001
+              and math.hypot(s_[1][0] - cube.x, s_[1][1] - cube.y) < 0.002), None)
+    if k is None or k + 1 >= len(steps) or steps[k + 1][0] != "close":
+        return None
+    down = list(steps[k][1])
+    xyz = [down[0], down[1], down[2] + cfg.GUIDED_HOVER_MM / 1000]
+    turn = 0.0                                    # degrees, + = anticlockwise seen from above (as cube.angle_deg)
+    busy = ["- Keep clear of the robot.", "- Ctrl+C in the Run window = stop"]
+
+    def pose(p_xyz=None, p_turn=None):
+        return list(p_xyz or xyz) + list(turned_rpy(down[3:], turn if p_turn is None else p_turn))
+
+    def go(new_xyz, new_turn, what):
+        """Move there if it is allowed; returns "" or the reason it did not move."""
+        nonlocal xyz, turn
+        gap_z = abs(new_xyz[2] - down[2]) if what == "height" else 0.0   # the hover height is not a correction
+        if max(abs(new_xyz[0] - down[0]), abs(new_xyz[1] - down[1]), gap_z) * 1000 > cfg.GUIDED_MAX_MM:
+            return f"- Not moved: more than {cfg.GUIDED_MAX_MM} mm from where the camera saw the cube."
+        if abs(new_turn) > GUIDED_MAX_DEG:
+            return f"- Not turned: more than {GUIDED_MAX_DEG} degrees."
+        try:
+            check_pose(pose(new_xyz, new_turn), poses)
+        except ValueError as e:
+            return f"- Not moved: {e}"
+        try:
+            while_busy(run_steps([("move", pose(new_xyz, new_turn))], poses), robot, picture, f"{which}: moving",
+                       busy)
+        except RuntimeError as e:                 # e.g. the gripper pressed on the cube or the platform
+            print(f"  Move refused by the robot: {e}")
+            return MOVE_REFUSED
+        xyz, turn = list(new_xyz), new_turn
+        return ""
+
+    while_busy(run_steps(steps[:k] + [("move", pose())], poses), robot, picture,
+               f"{which}: moving above the cube", busy)
+    stop_line = "- Esc = stop: nothing is picked, the robot goes back to rest."
+    stages = ["move", "turn", "height"]
+    stage, note = 0, ""
+    while True:
+        dx, dy, dz = ((xyz[i] - down[i]) * 1000 for i in range(3))
+        names = ["1 Keys: position", "2 Arrows: turn", "3 Arrows: height", "4 Keys: drop position"]
+        route = "- Steps:  " + "  ->  ".join(f"[{n}]" if i == stage else n for i, n in enumerate(names)) + \
+                "      ENTER = next step"
+        if stages[stage] == "move":
+            title = f"{which} - step 1 of 4: move the gripper over the MIDDLE of the cube"
+            lines = ["- Stand in front of the robot, at least 30 cm away. Look from the front, then from the side.",
+                     "- Press D to move it to your RIGHT, A to your LEFT (1 mm each press).",
+                     "- Press W to move it AWAY from you, S TOWARDS you (1 mm each press).",
+                     f"- Moved so far: {dx:+.0f} mm towards/away, {dy:+.0f} mm right/left.",
+                     "- Over the middle? Press ENTER to go to step 2 (turning), also if it was right already.",
+                     "- Guided picks teach the robot its corrections; they are NOT counted in your success rate.",
+                     stop_line]
+            allowed, hint = "wasd", "Use W, A, S, D to move, then ENTER."
+        elif stages[stage] == "turn":
+            title = f"{which} - step 2 of 4: turn the gripper to line up with the cube"
+            lines = ["- Look from at least 30 cm: the fingers should be parallel to two sides of the cube.",
+                     "- Press the LEFT arrow to turn anticlockwise, the RIGHT arrow to turn clockwise (2 degrees each).",
+                     f"- Turned so far: {turn:+.0f} degrees.",
+                     "- Lined up? Press ENTER: the gripper goes down to the grip height (it does not close yet).",
+                     stop_line]
+            allowed, hint = ("left", "right"), "Use the LEFT and RIGHT arrows to turn, then ENTER."
+        else:
+            title = f"{which} - step 3 of 4: check the height before it grips"
+            lines = ["- The fingers should be around the middle of the cube: not pressing on its top, not touching "
+                     "the platform.",
+                     "- Press the UP arrow to go up, the DOWN arrow to go down (1 mm each press).",
+                     f"- Height changed so far: {dz:+.0f} mm.",
+                     "- Right height? Press ENTER: the gripper closes and carries the cube to the square, where it "
+                     "stops again (step 4).", stop_line]
+            allowed, hint = ("up", "down"), "Use the UP and DOWN arrows, then ENTER."
+        key = ask_step(picture, title, [route] + lines + ([note] if note else []), set(allowed) | {"enter", "esc"},
+                       hint)
+        note = ""
+        if key == "esc":
+            while_busy(run_steps([("move", xyz[:2] + [poses["z_safe"]] + pose()[3:])], poses, then_rest=True), robot,
+                       picture, "Stopped: moving up, then to the sleep pose", busy)
+            return "stop"
+        if key == "enter":
+            if stages[stage] == "height":
+                break
+            stage += 1
+            if stages[stage] == "height":                       # down to the grip height
+                note = go([xyz[0], xyz[1], down[2]], turn, "height")
+            continue
+        mm, deg = 0.001, 2.0                  # standing in front of the robot: towards you = +x, your right = +y
+        new = list(xyz)
+        if key == "s":
+            new[0] += mm
+        elif key == "w":
+            new[0] -= mm
+        elif key == "d":
+            new[1] += mm
+        elif key == "a":
+            new[1] -= mm
+        elif key == "up":
+            new[2] += mm
+        elif key == "down":
+            new[2] -= mm
+        new_turn = turn + (deg if key == "left" else -deg if key == "right" else 0.0)
+        note = go(new, new_turn, stages[stage])
+    corr = [xyz[i] - down[i] for i in range(3)]
+    rest_steps = [("close",)]
+    for s_ in steps[k + 2:]:                   # the moves at the cube (e.g. back up) get the same correction
+        if s_[0] == "move" and math.hypot(s_[1][0] - cube.x, s_[1][1] - cube.y) < 0.002:
+            s_ = ("move", [s_[1][0] + corr[0], s_[1][1] + corr[1], s_[1][2]] + pose()[3:])
+        rest_steps.append(s_)
+    moving = ["- " + target, "- Ctrl+C in the Run window = stop (power switch for an emergency)"]
+    result = (corr[0] * 1000, corr[1] * 1000, corr[2] * 1000, turn)
+
+    # ---- step 4: stop just above the drop position (the move before open_gripper())
+    d = next((i for i, s_ in enumerate(rest_steps) if s_[0] == "open"), None)
+    if d is None or d == 0 or rest_steps[d - 1][0] != "move":
+        while_busy(run_steps(rest_steps, poses, then_rest=True), robot, picture, "Robot moving - keep clear", moving)
+        return result
+    drop = list(rest_steps[d - 1][1])
+    dxy = [drop[0], drop[1]]
+    dturn = 0.0                                   # extra turn at the drop, degrees (+ = anticlockwise from above)
+    hover = drop[2] + GUIDED_DROP_HOVER_MM / 1000
+
+    def drop_pose(xy, z, t):
+        return list(xy) + [z] + list(turned_rpy(drop[3:], t))
+    while_busy(run_steps(rest_steps[:d - 1] + [("move", drop_pose(dxy, hover, dturn))], poses), robot, picture,
+               "Robot moving to the square - keep clear", moving)
+    note = ""
+    while True:
+        ddx, ddy = (dxy[0] - drop[0]) * 1000, (dxy[1] - drop[1]) * 1000
+        route = "- Steps:  " + "  ->  ".join(n if i < 3 else f"[{n}]" for i, n in enumerate(names)) + \
+                "      ENTER = drop"
+        title = f"{which} - step 4 of 4: is the cube right above square {square}?"
+        lines = [route,
+                 f"- The cube is {GUIDED_DROP_HOVER_MM} mm above where it will be let go (square {square}, level {level}).",
+                 "- From at least 30 cm, look from the front, then from the side: is it centred over the square?",
+                 "- Press D to move it to your RIGHT, A to your LEFT (1 mm each press).",
+                 "- Press W to move it AWAY from you, S TOWARDS you (1 mm each press).",
+                 "- Press the LEFT arrow to turn it anticlockwise, the RIGHT arrow clockwise (2 degrees each), so it "
+                 "lines up with the square.",
+                 f"- Changed so far: {ddx:+.0f} mm towards/away, {ddy:+.0f} mm right/left, turn {dturn:+.0f} degrees.",
+                 f"- Lined up? Press ENTER: it goes down and lets go. Changes are saved for square {square}, every "
+                 "level.",
+                 "- Esc = no change: drop at the saved position."]
+        key = ask_step(picture, title, lines + ([note] if note else []),
+                       {"w", "a", "s", "d", "left", "right", "enter", "esc"},
+                       "Use W, A, S, D to move, LEFT / RIGHT arrows to turn, then ENTER.")
+        note = ""
+        if key == "esc":
+            dxy, dturn = [drop[0], drop[1]], 0.0
+            break
+        if key == "enter":
+            break
+        st = 0.001
+        new = list(dxy)
+        new[0] += {"s": st, "w": -st}.get(key, 0.0)
+        new[1] += {"d": st, "a": -st}.get(key, 0.0)
+        new_turn = dturn + {"left": 2.0, "right": -2.0}.get(key, 0.0)
+        if max(abs(new[0] - drop[0]), abs(new[1] - drop[1])) * 1000 > cfg.GUIDED_MAX_MM:
+            note = f"- Not moved: more than {cfg.GUIDED_MAX_MM} mm from the saved drop position."
+            continue
+        if abs(new_turn) > GUIDED_MAX_DEG:
+            note = f"- Not turned: more than {GUIDED_MAX_DEG} degrees."
+            continue
+        try:
+            check_pose(drop_pose(new, hover, new_turn), poses)
+        except ValueError as e:
+            note = f"- Not moved: {e}"
+            continue
+        try:
+            while_busy(run_steps([("move", drop_pose(new, hover, new_turn))], poses), robot, picture,
+                       f"{which}: moving", busy)
+        except RuntimeError as e:
+            print(f"  Move refused by the robot: {e}")
+            note = MOVE_REFUSED
+            continue
+        dxy, dturn = new, new_turn
+    shift = [dxy[0] - drop[0], dxy[1] - drop[1]]
+    tail = [("move", drop_pose(dxy, drop[2], dturn))]
+    for s_ in rest_steps[d:]:                  # the moves at the square (e.g. back up) get the same shift and turn
+        if s_[0] == "move" and math.hypot(s_[1][0] - drop[0], s_[1][1] - drop[1]) < 0.002:
+            s_ = ("move", [s_[1][0] + shift[0], s_[1][1] + shift[1], s_[1][2]] + list(turned_rpy(s_[1][3:], dturn)))
+        tail.append(s_)
+    while_busy(run_steps(tail, poses, then_rest=True), robot, picture, "Robot moving - keep clear", moving)
+    if max(abs(shift[0]), abs(shift[1])) >= 0.0005:
+        save_drop_xy(square, level, dxy, poses)
+        print(f"  Drop position of square {square} (every level) moved by x {shift[0] * 1000:+.0f} mm, "
+              f"y {shift[1] * 1000:+.0f} mm (saved in {cfg.LAB5_FILE.name}, old file kept as a backup)")
+    if abs(dturn) >= 1:
+        turns = load_drop_turns()
+        total = turns.get(square, turns.get(f"{square} {level}", 0.0)) + dturn
+        save_drop_turn(square, total)
+        print(f"  Drop turn of square {square} (every level): {dturn:+.0f} deg, now {total:+.0f} deg in total "
+              f"(saved in {DROP_TURN_FILE.name})")
+    return result
+
+
+DROP_TURN_FILE = cfg.CALIB_DIR / "drop_turn.json"        # guided picks, step 4: gripper turn at each drop
+
+
+def load_drop_turns():
+    try:
+        return json.loads(DROP_TURN_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def with_drop_turn(steps, square, level):
+    """The recorded steps with the saved turn for this drop (square, level) added at the drop: the move
+    before open_gripper() and the moves at the same place after it."""
+    turns = load_drop_turns()
+    turn = turns.get(square, turns.get(f"{square} {level}", 0.0))       # one turn per square (all levels)
+    c = next((i for i, s_ in enumerate(steps) if s_[0] == "close"), len(steps))
+    d = next((i for i, s_ in enumerate(steps) if s_[0] == "open" and i > c), None)   # the open after the grip
+    if not turn or d is None or d == 0 or steps[d - 1][0] != "move":
+        return list(steps)
+    drop = steps[d - 1][1]
+    out = list(steps)
+    for i in range(c, len(out)):              # every move at the drop place, from above it to back up
+        s_ = out[i]
+        if s_[0] == "move" and math.hypot(s_[1][0] - drop[0], s_[1][1] - drop[1]) < 0.002:
+            out[i] = ("move", list(s_[1][:3]) + list(turned_rpy(s_[1][3:], turn)))
+    return out
+
+
+def save_drop_turn(square, turn):
+    turns = {k: v for k, v in load_drop_turns().items() if not k.startswith(square)}   # old per-level entries
+    turns[square] = round(float(turn), 1)
+    cfg.CALIB_DIR.mkdir(exist_ok=True)
+    DROP_TURN_FILE.write_text(json.dumps(turns, indent=2))
+
+
+MOVE_REFUSED = ("- The robot STOPPED: the gripper pressed on something (the cube or the platform), or the wrist "
+                "could not turn there. Move back (e.g. the UP arrow) and try smaller steps.")
+
+
+def save_drop_xy(square, level, xy, poses):
+    """Save a new x, y for the DROP positions of one square at EVERY level (a stack is vertical: only
+    the heights differ, and they are not changed), with a backup of the old file. Pick positions are
+    not changed, so step 1.5 stays ticked. level: the level where it was corrected (marked tested)."""
+    data = read_lab5_file()
+    for lv in data["drop"][square]:
+        old = data["drop"][square][lv]
+        data["drop"][square][lv] = [round(float(xy[0]), 4), round(float(xy[1]), 4), old[2]]
+        poses["drop"][square][lv] = list(data["drop"][square][lv])        # used from the next pick on
+    data["tested"][f"drop {square} {level}"] = "ok"
+    backup = f"lab5_positions_backup_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    shutil.copy(cfg.LAB5_FILE, cfg.CALIB_DIR / backup)
+    save_lab5_file(data)
+
+
 VOICE_WORDS = ("Voice words:  red / yellow / green = sort only that colour,  all = every colour,  "
                "go = pick,  skip = leave it,  stop = end")
 
@@ -331,17 +689,18 @@ def turn_text(cube, at_cube, at_square):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    # Technician's test without a robot (commands only printed, e.g. with --source): not part of the lab.
+    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--auto", action="store_true")
     parser.add_argument("--stacks", default="0,0,0")
-    parser.add_argument("--source", default=None)
+    parser.add_argument("--source", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--voice", action="store_true", help="optional extra: voice commands")
     parser.add_argument("--measure-offset", action="store_true",
                         help="ask for the gripper offset from the cube centre (mm) after each pick")
     args = parser.parse_args()
     if args.source is not None and not args.dry_run:
         raise SystemExit("--source (saved images) is only allowed with --dry-run")
-    CURRENT_STEP[0] = "4:Dry run" if args.dry_run else "4:Robot trials"
+    CURRENT_STEP[0] = "4:Robot trials"
     print_progress(CURRENT_STEP[0])
 
     poses = load_lab5_poses()
@@ -358,13 +717,46 @@ def main():
 
     cfg.RESULTS_DIR.mkdir(exist_ok=True)
     log_path = cfg.RESULTS_DIR / "trials.csv"
+    columns = ["time", "label", "confidence", "x_mm", "y_mm", "angle_deg", "square", "level", "outcome", "dry_run",
+               "parallax_corrected", "offset_mm", "failure_cause", "guided"]
+    if log_path.exists():                         # an older file without the "guided" column: add it (empty)
+        with open(log_path, newline="") as f:
+            old_rows = list(csv.DictReader(f))
+        if old_rows and "guided" not in old_rows[0]:
+            with open(log_path, "w", newline="") as f:
+                w = csv.DictWriter(f, columns)
+                w.writeheader()
+                w.writerows({c: r.get(c, "") for c in columns} for r in old_rows)
     new_log = not log_path.exists()
     log_file = open(log_path, "a", newline="")
     log = csv.writer(log_file)
     if new_log:
-        log.writerow(["time", "label", "confidence", "x_mm", "y_mm", "angle_deg",
-                      "square", "level", "outcome", "dry_run", "parallax_corrected", "offset_mm",
-                      "failure_cause"])
+        log.writerow(columns)
+
+    print(f"step4_sort_blocks.py version {VERSION}")
+    correction = load_pick_correction()
+    start_correction = correction
+    base_z_offset = cfg.ZONE_PICK_OFFSET_MM
+    cfg.ZONE_PICK_OFFSET_MM = base_z_offset + correction["dz_mm"]        # used by pick_and_drop()
+    guided_left = 0 if (args.dry_run or args.auto) else cfg.GUIDED_PICKS
+    guided = []                                   # this run's guided picks: total correction (mm, deg)
+    changes = []                                  # this run's guided picks: what you changed (mm, deg)
+    corr_path = cfg.RESULTS_DIR / "pick_corrections.csv"
+    header = ("time,label,camera_x_mm,camera_y_mm,camera_angle_deg,applied_dx_mm,applied_dy_mm,applied_dz_mm,"
+              "applied_turn_deg,dx_mm,dy_mm,dz_mm,turn_deg,parallax_corrected\n")
+    if corr_path.exists() and corr_path.open().readline() != header:      # older file without the turn
+        corr_path.rename(corr_path.with_name("pick_corrections_old.csv"))
+    if not corr_path.exists():
+        corr_path.write_text(header)
+    guided_angles = []                            # cube angle (as seen) of each guided pick
+    if correction["picks"]:
+        print(f"Pick correction applied (from {cfg.PICK_CORRECTION_FILE.name}): x {correction['dx_mm']:+.1f} mm, "
+              f"y {correction['dy_mm']:+.1f} mm, height {correction['dz_mm']:+.1f} mm, turn "
+              f"{correction['turn_deg']:+.1f} deg")
+    if guided_left:
+        print(f"Guided picks: the first {guided_left} picks stop above the cube for your correction.\n"
+              "  Put those cubes at DIFFERENT places and angles in the zone. Guided picks are not counted in the "
+              "success rate:\n  the picks after them are the real trials.")
 
     print(f"Model {model.name}. Stacks at start: {stacks}")
     robot.start()
@@ -396,8 +788,9 @@ def main():
         return img
     try:
         while True:
-            while_busy(lambda r: r.move_joints(cfg.OBSERVE_JOINTS), robot, live("STILL"),
-                       "Robot moving to the observe position", ["Keep clear. Ctrl+C in the Run window = stop"])
+            while_busy(lambda r: (r.learning_mode(False), r.move_joints(cfg.OBSERVE_JOINTS), r.learning_mode(True)),
+                       robot, live("STILL"), "Robot moving to the observe position (sleep pose, learning mode on)",
+                       ["Keep clear. Ctrl+C in the Run window = stop"])
             time.sleep(0.5)                        # let the arm settle before the picture
             frame = cam.read_fresh()
             result = vision.process(frame)
@@ -451,6 +844,10 @@ def main():
                     break
                 continue
             empty_looks = 0
+            seen_x, seen_y, seen_angle = cube.x, cube.y, cube.angle_deg   # what the camera saw
+            cube.x += correction["dx_mm"] / 1000             # learned pick correction (guided picks)
+            cube.y += correction["dy_mm"] / 1000
+            cube.angle_deg += correction["turn_deg"]         # used by pick_and_drop() when USE_ORIENTATION
 
             square = cfg.COLOUR_TO_SQUARE[cube.label]
             level = stacks[square] + 1                    # level 1 = first cube on the square
@@ -499,9 +896,73 @@ def main():
                 continue
 
             still = live_target(cube, "STILL")                    # the picture stays still while the robot moves
-            while_busy(recorder.replay, robot, still, "Robot moving - keep clear",
-                       [target + "   " + turns, "Ctrl+C in the Run window = stop (power switch for an emergency)"]
-                       + (["Voice: words said while the robot moves are ignored"] if voice is not None else []))
+            result_ = None
+            was_guided = False                    # corrected by hand: not counted in the success rate
+            if guided_left > 0:
+                which = f"Guided pick {cfg.GUIDED_PICKS - guided_left + 1} of {cfg.GUIDED_PICKS}"
+                result_ = guided_pick(recorder, robot, cube, poses, lambda: live_target(cube), target, which,
+                                      square, level)
+                if result_ == "stop":
+                    print("Guided pick stopped: nothing picked")
+                    continue
+                if result_ is None:
+                    print("Guided pick not possible (no move down to the cube followed by close_gripper()): "
+                          "normal pick")
+            if result_ is None:
+                while_busy(run_steps(with_drop_turn(recorder.steps, square, level), poses, then_rest=True), robot,
+                           still, "Robot moving - keep clear",
+                           [target + "   " + turns, "Ctrl+C in the Run window = stop (power switch for an emergency)"]
+                           + (["Voice: words said while the robot moves are ignored"] if voice is not None else []))
+            else:
+                guided_left -= 1
+                was_guided = True
+                applied = [correction["dx_mm"], correction["dy_mm"], correction["dz_mm"],
+                           correction["turn_deg"] if cfg.USE_ORIENTATION else 0.0]
+                guided.append([applied[i] + result_[i] for i in range(4)])       # total correction at this pick
+                changes.append(result_)
+                guided_angles.append(seen_angle)
+                print(f"  Guided correction: x {result_[0]:+.0f} mm, y {result_[1]:+.0f} mm, "
+                      f"height {result_[2]:+.0f} mm, turn {result_[3]:+.0f} deg  ({guided_left} guided pick(s) left)")
+                with open(corr_path, "a") as f:
+                    f.write(f"{datetime.now().isoformat(timespec='seconds')},{cube.label},{seen_x * 1000:.1f},"
+                            f"{seen_y * 1000:.1f},{seen_angle:.1f},{correction['dx_mm']},{correction['dy_mm']},"
+                            f"{correction['dz_mm']},{correction['turn_deg']},{result_[0]:.1f},{result_[1]:.1f},"
+                            f"{result_[2]:.1f},{result_[3]:.0f},{cfg.USE_PARALLAX_CORRECTION}\n")
+                # Saved after EVERY guided pick and used from the NEXT pick on (running average), so the next
+                # guided pick already starts closer and nothing is lost if the run stops early.
+                correction, spread, slope = save_pick_correction(start_correction, guided, guided_angles)
+                cfg.ZONE_PICK_OFFSET_MM = base_z_offset + correction["dz_mm"]
+                print(f"  Saved and used from the next pick on: x {correction['dx_mm']:+.1f} mm, "
+                      f"y {correction['dy_mm']:+.1f} mm, height {correction['dz_mm']:+.1f} mm, "
+                      f"turn {correction['turn_deg']:+.1f} deg")
+                if guided_left == 0:
+                    mean = [sum(c[i] for c in changes) / len(changes) for i in range(4)]
+                    lines = [f"- On average you changed: x {mean[0]:+.1f} mm, y {mean[1]:+.1f} mm, "
+                             f"height {mean[2]:+.1f} mm, turn {mean[3]:+.1f} deg per guided pick.",
+                             f"- Total correction now: x {correction['dx_mm']:+.1f}, y {correction['dy_mm']:+.1f}, "
+                             f"height {correction['dz_mm']:+.1f} mm, turn {correction['turn_deg']:+.1f} deg  "
+                             f"({cfg.PICK_CORRECTION_FILE.name})"]
+                    if not cfg.USE_PARALLAX_CORRECTION and spread <= 3:
+                        lines += ["- Notice: did the gripper often need shifting the same way, more for cubes further "
+                                  "from the camera? That is parallax: the camera sees the cube tops from an angle.",
+                                  "- Optional, to fine-tune the picking: correct it with USE_PARALLAX_CORRECTION "
+                                  "(config.py), or learn it from your corrections in results/pick_corrections.csv "
+                                  "(guide: 'Optional: fine-tuning the picking')."]
+                    if not cfg.USE_ORIENTATION and abs(mean[3]) >= 1:
+                        lines.append("- The turn correction is only used when USE_ORIENTATION = True (config.py).")
+                    if slope is not None and slope < -1.2:
+                        lines.append("- Your turn corrections grow with the cube's angle, the other way: the gripper "
+                                     "turns the WRONG WAY. Run test_wrist_turn.py and check YAW_SIGN in config.py.")
+                    elif slope is not None and abs(slope) > 0.5:
+                        lines.append(f"- Your turn corrections depend on the cube's angle (slope {slope:+.1f}): one "
+                                     "average cannot fix that. Check how the cube angle is measured.")
+                    if spread > 3:
+                        lines.append(f"- Your corrections differ by up to {spread:.0f} mm from place to place: one "
+                                     "offset cannot fix that. It is parallax. Recommended: measure CAMERA_POSITION_M and switch on "
+                                     "USE_PARALLAX_CORRECTION (config.py).")
+                    print("\n".join(lines))
+                    ask("Enter = carry on", False, live, "Guided picks done", lines, GREEN, "\r",
+                        "Press Enter to carry on (click on the camera window first).")
             stacks[square] += 1
 
             outcome = ""
@@ -522,7 +983,7 @@ def main():
             log.writerow([datetime.now().isoformat(timespec="seconds"), cube.label, round(cube.confidence, 3),
                           round(cube.x * 1000, 1), round(cube.y * 1000, 1), round(cube.angle_deg, 1),
                           square, level, outcome, args.dry_run, cfg.USE_PARALLAX_CORRECTION, offset,
-                          cause])
+                          cause, was_guided])
             log_file.flush()
             print(f"Stacks now: {stacks}")
     except KeyboardInterrupt:

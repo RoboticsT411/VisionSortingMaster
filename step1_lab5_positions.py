@@ -13,8 +13,9 @@ In this window you:
   1. Type the gripper orientation (roll, pitch, yaw) and every pick-up and drop
      position (x, y, z in metres) from your Lab 5 program. Your program may use
      other names: only the numbers matter.
-     Or connect to the robot, select a position, switch learning mode on, move
-     the arm there by hand and press "Read robot position".
+     Or (technician only, risk assessment RA001650/2: students keep 30 cm from a
+     powered robot) connect, select a position, switch learning mode on, move the arm
+     there by hand and press "Read robot position".
   2. Fix anything shown in red. Every value is checked as you type: x and y
      inside the safe area, z never below Z_MIN (config.py) so a typing error
      such as 0.009 instead of 0.093 cannot drive the gripper into the platform,
@@ -251,8 +252,8 @@ class Lab5Window:
         elif empty:
             step, hint, colour = (f"STEP 2: enter your Lab 5 values ({empty} boxes still empty)",
                                   "Type each value from your Lab 5 program (metres and radians), or connect, "
-                                  "select a position, switch learning mode ON,\nmove the arm there by hand and "
-                                  "press 'Read robot position'.\nIf staff saved positions for your robot, press 'Load saved positions'.",
+                                  "select a position, and ask the technician to switch learning mode ON,\nmove the arm there by hand and "
+                                  "press 'Read robot position' (keep 30 cm from the robot yourself).\nIf staff saved positions for your robot, press 'Load saved positions'.",
                                   "#204080")
         elif errors:
             step, hint, colour = (f"Fix the {len(errors)} value(s) shown in red",
@@ -329,7 +330,7 @@ class Lab5Window:
         self.learning = not self.learning
         self.robot.learning_mode(self.learning)
         self.learn_btn.config(text=f"Learning mode: {'ON' if self.learning else 'OFF'}")
-        self.idle("Learning mode ON: move the arm by hand, then press 'Read robot position'." if self.learning
+        self.idle("Learning mode ON: the technician moves the arm by hand, then press 'Read robot position'." if self.learning
                   else "Learning mode OFF: the motors hold the arm.")
 
     def read_position(self):

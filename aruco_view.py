@@ -163,17 +163,22 @@ class TopDownView:
         return cv2.warpPerspective(frame, self.H, (self.width, self.height))
 
     def _make_zone_mask(self):
-        """White where a cube may be picked: inside the markers, away from the edges."""
+        """White where a cube may be picked: between the markers, a cube fully in the picture and
+        never on a marker (see config.py: EDGE_MARGIN_MM, MARKER_KEEP_OUT_MM)."""
         pts = np.array([self.robot_to_topdown(*xy) for xy in self.marker_xy_m.values()])
         centre = pts.mean(axis=0)
         order = np.argsort(np.arctan2(pts[:, 1] - centre[1], pts[:, 0] - centre[0]))
         mask = np.zeros((self.height, self.width), np.uint8)
         cv2.fillPoly(mask, [np.int32(pts[order])], 255)
-        shrink_mm = cfg.MARKER_SIZE_MM / 2 + cfg.EDGE_MARGIN_MM
+        shrink_mm = cfg.CUBE_SIZE_MM / 2 + cfg.EDGE_MARGIN_MM
         r = max(1, int(shrink_mm * cfg.PX_PER_MM))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         # Pixels outside the image count as "not zone", so the edges shrink too.
-        return cv2.erode(mask, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        mask = cv2.erode(mask, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        around_mm = (cfg.MARKER_SIZE_MM + cfg.CUBE_SIZE_MM) / 2 * np.sqrt(2) + cfg.MARKER_KEEP_OUT_MM
+        for u, v in pts:
+            cv2.circle(mask, (int(round(u)), int(round(v))), int(around_mm * cfg.PX_PER_MM), 0, -1)
+        return mask
 
     # ------------------------------------------------------------ coordinates
     def robot_to_topdown(self, x_m, y_m):

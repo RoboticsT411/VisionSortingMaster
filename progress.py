@@ -28,7 +28,8 @@ def _trials():
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
     dry = sum(1 for r in rows if r.get("dry_run") == "True")
-    return dry, len(rows) - dry
+    guided = sum(1 for r in rows if r.get("dry_run") != "True" and r.get("guided") == "True")
+    return dry, len(rows) - dry - guided          # guided picks (corrected by hand) are not trials
 
 
 def _lab5_changed_since(snapshot):
@@ -86,8 +87,7 @@ def project_status(max_age=2.0):
     live = list(cfg.RESULTS_DIR.glob("live_*_camera.png")) if cfg.RESULTS_DIR.exists() else []
     status.append(("3c", "Live test", bool(live), "screenshot saved" if live else "", False))
     status.append(("3d", "Experiments", (cfg.RESULTS_DIR / "experiments.txt").exists(), "", False))
-    dry, real = _trials()
-    status.append(("4", "Dry run", dry > 0, "", dry > 0))
+    _, real = _trials()
     status.append(("4", "Robot trials", real >= TRIALS_TARGET, f"{real}/{TRIALS_TARGET} cubes" if real else "",
                    real > 0))
     _cache.update(time=time.time(), status=status)

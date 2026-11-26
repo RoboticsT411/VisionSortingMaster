@@ -1,5 +1,5 @@
 """
-Settings for the Project 1 vision sorting code.
+Settings for the AI vision colour sorting project.
 
 Change the values in this file to match your robot station.
 Values that you MEASURE are not typed here: your Lab 5 pick and drop positions are
@@ -76,8 +76,15 @@ PARALLAX_HEIGHT_MM = 25           # height of the point whose position is correc
 
 # ---------------------------------------------------------------- top-down view
 PX_PER_MM = 2.0            # resolution of the top-down image (2 px = 1 mm)
-EDGE_MARGIN_MM = 10        # cubes closer than this to the zone edge are ignored
-KEEP_OUT_RADIUS_MM = 30    # no picking within this distance of squares A, B and C
+# The pick zone is as big as it can be: the area between the 4 marker centres, minus
+#  - a strip along each edge, so a cube is fully in the picture: half a cube + EDGE_MARGIN_MM,
+#  - a circle round each marker, so a cube never covers a marker (the camera would lose it):
+#    half the marker's diagonal + half the cube's diagonal + MARKER_KEEP_OUT_MM,
+#  - a circle of KEEP_OUT_RADIUS_MM round squares A, B and C, so cubes already dropped there are
+#    not picked again (half the hole, 12.5 mm, + half a cube).
+EDGE_MARGIN_MM = 2         # mm, see above
+MARKER_KEEP_OUT_MM = 3     # mm, see above
+KEEP_OUT_RADIUS_MM = 23    # mm, see above
 
 # ---------------------------------------------------------------- cubes
 CUBE_SIZE_MM = 20          # measure one of your cubes with a ruler and update
@@ -130,6 +137,17 @@ SAFE_CLEARANCE_M = 0.05
 # level 1. If cubes in the zone sit higher or lower than cubes on the squares,
 # change this (mm, + = higher).
 ZONE_PICK_OFFSET_MM = 0
+# Guided picks (step 4): the first picks of every run stop 20 mm above the cube, again at the grip
+# height, and 5 mm above the drop position, so you can correct the gripper with the keys. The average
+# of your pick corrections is saved after every guided pick (PICK_CORRECTION_FILE) and applied to
+# every later pick; a drop correction is saved to the Lab 5 positions. 0 = no guided picks.
+GUIDED_PICKS = 5
+GUIDED_HOVER_MM = 20
+GUIDED_MAX_MM = 15         # a correction larger than this is refused: look for the cause instead
+GUIDED_MAX_DEG = 30        # the same for the turn (degrees)
+GUIDED_DROP_HOVER_MM = 5   # step 4 of a guided pick: stop this far above the drop position (corrected x, y
+                           # is saved to the Lab 5 DROP position of that square and level)
+PICK_CORRECTION_FILE = CALIB_DIR / "pick_correction.json"
 # Optional extra: voice commands in step 4 (needs vosk, sounddevice and a model folder,
 # see voice_commands.py). True = on without typing --voice.
 USE_VOICE = False

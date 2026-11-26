@@ -4,7 +4,7 @@ STEP 4.3 - Summarise your robot trials against the specification.
     python trials_summary.py
 
 Reads results/trials.csv (written by step4_sort_blocks.py) and prints, for the real
-robot runs (dry runs are left out):
+robot runs (dry runs and guided picks, which you corrected with the keys, are left out):
   - pick success rate (cubes placed correctly), with a 95 % confidence interval
   - wrong-colour drops and the other failure causes (you give the cause when you answer
     n after a pick), with the upper limit of the true rate when none happened
@@ -42,14 +42,22 @@ def main():
     if not path.exists():
         raise SystemExit("No results/trials.csv yet: run step4_sort_blocks.py with the robot first.")
     with open(path, newline="") as f:
-        rows = [r for r in csv.DictReader(f) if r.get("dry_run") != "True"]
+        real = [r for r in csv.DictReader(f) if r.get("dry_run") != "True"]
+    # Guided picks were corrected with the keys: they show how much correcting was needed, not how well the
+    # robot does on its own, so they are reported separately and left out of every rate below.
+    guided = [r for r in real if r.get("guided") == "True"]
+    rows = [r for r in real if r.get("guided") != "True"]
     if not rows:
-        raise SystemExit("trials.csv only holds dry runs: run step4_sort_blocks.py without --dry-run.")
+        raise SystemExit("No unguided robot picks yet: the first picks of each run are guided (corrected with the keys) "
+                         "and do not count. Run step4_sort_blocks.py for more picks.")
 
     answered = [r for r in rows if r.get("outcome") in ("y", "n")]
     placed = sum(r["outcome"] == "y" for r in answered)
     wrong = sum(r.get("failure_cause") == "wrong colour" for r in answered)
-    lines = [f"Robot trials: {len(rows)} picks ({len(answered)} with an answer to 'placed correctly?')", "",
+    g_ok = sum(r.get("outcome") == "y" for r in guided)
+    lines = [f"Robot trials: {len(rows)} picks by the robot on its own ({len(answered)} with an answer to "
+             f"'placed correctly?')",
+             f"Guided picks (corrected with the keys, NOT counted below): {len(guided)}, {g_ok} placed correctly", "",
              f"Pick success (R5):        {rate_text(placed, len(answered))}"]
 
     lines.append(f"Wrong-colour drops (R4):  {rate_text(wrong, len(answered))}")

@@ -1,4 +1,4 @@
-# Project 1 specification: vision-based block sorting
+# Specification: AI vision colour sorting with the Niryo One
 
 This is the specification your system must meet, as an engineer would receive it from a
 client. Read it before you start. Your report shows, requirement by requirement, whether your
@@ -40,7 +40,7 @@ bands. "How it is measured" names the program that gives you the number.
 | R8 | Time per cube | ≤ 30 s | ≤ 15 s | `trials_summary.py` |
 | R9 | Skipped cubes of red, yellow or green | ≤ 15 % | ≤ 5 % | threshold curve (`step3_experiments.py`), checked by counting cubes left after a run |
 | R10 | Other lighting | accuracy drops ≤ 15 points | ≤ 5 points, and how you achieved it | `step3_experiments.py` lighting shift |
-| R11 | Safety | no collision; every move rehearsed and confirmed | — | observation; the step 4 review |
+| R11 | Safety | no collision; every move checked against the safe area and confirmed; risk assessment RA001650/2 followed | — | observation; the step 4 review |
 
 ## 3. Cost of errors and the confidence threshold
 
@@ -132,7 +132,7 @@ z up. All positions in the code are in metres in this frame.
 | Yellow confused with orange | medium | an orange cube dropped on B (wrong drop) | enough images of both; threshold from section 3 |
 | Glare on a cube or marker | medium | missed cube or marker | camera auto-tune; matte markers |
 | Wrong colour dropped | low | restack | threshold from section 3; R4 |
-| Arm hits the camera arm or a stack | low | damage | pose limits, rehearsal of every move, a person confirms each move, power switch within reach |
+| Arm hits the camera arm or a stack | low | damage | pose limits, every move checked before the robot moves, a person confirms each move, power switch within reach |
 
 ## 8. Your report
 
