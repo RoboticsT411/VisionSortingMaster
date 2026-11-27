@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/VisionSortingSimulation.iml" filepath="$PROJECT_DIR$/.idea/VisionSortingSimulation.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/VisionSortingMaster.iml" filepath="$PROJECT_DIR$/.idea/VisionSortingMaster.iml" />
     </modules>
   </component>
 </project>
