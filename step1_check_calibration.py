@@ -61,6 +61,7 @@ import json
 import math
 import queue
 import shutil
+import sys
 import threading
 from datetime import datetime
 from itertools import combinations
@@ -77,7 +78,10 @@ from progress import project_status, with_progress
 from ui import instruction_box
 
 WINDOW = "calibration"
-VERSION = "25 Nov 2026 11:05 (step 5 includes the robot's own scale)"
+VERSION = "26 Nov 2026 16:10 (also runs in the online simulator)"
+# The online simulator (Python in a web browser) has no real threads: there each robot command runs
+# straight away and the camera picture pauses during the move. On the lab PC nothing changes.
+NO_THREADS = sys.platform == "emscripten"
 TOLERANCE_MM = 5.0          # confirmation: each square within this of its Lab 5 position
 FIT_MM = 2.5                # calibration: after the best placement, each square within this
 FIT_ROBOT_MM = 6.0          # ...or within this when all three squares were centred with the robot
@@ -335,55 +339,75 @@ class RobotTest(threading.Thread):
         self.robot = None
 
     def run(self):
+        if not self.connect():
+            return
+        if NO_THREADS:                 # browser simulator: send() runs each command itself
+            return
+        while True:
+            if not self.do(self.commands.get()):
+                return
+
+    def connect(self):
         try:
             from robot import NiryoRobot
             self.robot = NiryoRobot()
             self.robot.start()
             self.state, self.status = "ready", f"Robot {self.robot.ip} ready"
+            return True
         except BaseException as e:                       # NiryoRobot.start() raises SystemExit on failure
             self.state = "failed"
             self.status = "Could not connect: " + str(e).strip().splitlines()[0][:90]
-            return
-        while True:
-            cmd = self.commands.get()
-            try:
-                if cmd[0] == "test":
-                    _, name, pose, z_safe = cmd
-                    self.state, self.status = "moving", f"Moving to {name}..."
-                    self.robot.learning_mode(False)                     # motors on to move
-                    self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
-                    self.robot.move_pose(pose)
-                    self.state, self.status = "arrived", f"Gripper at {name}"
-                elif cmd[0] == "jog":                                   # a small correction while centring
-                    self.state = "moving"
-                    self.robot.move_pose(cmd[1])
-                    self.state, self.status = "arrived", "Adjusted"
-                elif cmd[0] == "up":                                    # back up, then rest
-                    _, pose, z_safe = cmd
-                    self.state, self.status = "moving", "Moving back up..."
-                    self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
-                    self.robot.move_joints(cfg.SLEEP_JOINTS)
-                    self.robot.learning_mode(True)
-                    self.state, self.status = "ready", "Robot resting (sleep pose, learning mode on)"
-                elif cmd[0] == "rest":                                  # L key: sleep pose, learning mode
-                    self.state, self.status = "moving", "Moving to the sleep pose..."
-                    self.robot.move_joints(cfg.SLEEP_JOINTS)
-                    self.robot.learning_mode(True)
-                    self.state, self.status = "ready", "Robot resting (sleep pose, learning mode on)"
-                elif cmd[0] == "quit":
-                    self.robot.finish()
-                    self.state = "closed"
-                    return
-            except Exception as e:
-                self.state, self.status = "ready", f"Move failed: {e}"
+            return False
+
+    def do(self, cmd):
+        """Carry out one command. Returns False after "quit"."""
+        try:
+            if cmd[0] == "test":
+                _, name, pose, z_safe = cmd
+                self.state, self.status = "moving", f"Moving to {name}..."
+                self.robot.learning_mode(False)                     # motors on to move
+                self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
+                self.robot.move_pose(pose)
+                self.state, self.status = "arrived", f"Gripper at {name}"
+            elif cmd[0] == "jog":                                   # a small correction while centring
+                self.state = "moving"
+                self.robot.move_pose(cmd[1])
+                self.state, self.status = "arrived", "Adjusted"
+            elif cmd[0] == "up":                                    # back up, then rest
+                _, pose, z_safe = cmd
+                self.state, self.status = "moving", "Moving back up..."
+                self.robot.move_pose([pose[0], pose[1], z_safe] + pose[3:])
+                self.robot.move_joints(cfg.SLEEP_JOINTS)
+                self.robot.learning_mode(True)
+                self.state, self.status = "ready", "Robot resting (sleep pose, learning mode on)"
+            elif cmd[0] == "rest":                                  # L key: sleep pose, learning mode
+                self.state, self.status = "moving", "Moving to the sleep pose..."
+                self.robot.move_joints(cfg.SLEEP_JOINTS)
+                self.robot.learning_mode(True)
+                self.state, self.status = "ready", "Robot resting (sleep pose, learning mode on)"
+            elif cmd[0] == "quit":
+                self.robot.finish()
+                self.state = "closed"
+                return False
+        except Exception as e:
+            self.state, self.status = "ready", f"Move failed: {e}"
+        return True
 
     def send(self, *cmd):
+        if NO_THREADS:                 # browser simulator: run the command now (the picture pauses meanwhile)
+            if self.state not in ("connecting", "failed", "closed"):
+                self.do(cmd)
+            return
         if cmd[0] in ("test", "jog", "up", "rest") and self.state not in ("connecting", "failed"):
             self.state = "moving"
         self.commands.put(cmd)
 
     def close(self):
-        if self.state not in ("failed", "closed", "connecting") and self.is_alive():
+        if self.state in ("failed", "closed", "connecting"):
+            return
+        if NO_THREADS:
+            self.do(("quit",))
+        elif self.is_alive():
             self.send("quit")
             self.join(timeout=30)
 

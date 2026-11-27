@@ -189,7 +189,7 @@ def review_moves(steps, cube, poses, square, level, tol=0.005):
 CURRENT_STEP = ["4:Robot trials"]
 GUIDED_MAX_DEG = getattr(cfg, "GUIDED_MAX_DEG", 30)    # in case config.py is older than this file
 GUIDED_DROP_HOVER_MM = getattr(cfg, "GUIDED_DROP_HOVER_MM", 5)
-VERSION = "26 Nov 2026 12:55 (guided picks in 3 steps: move, turn with arrows, height)"
+VERSION = "26 Nov 2026 17:45 (robot stops handled: back to step 1, recorded in the trials)"
 
 
 def show_status(cam_img, title, lines, colour, refresh=True):
@@ -293,6 +293,15 @@ def rest(r):
     r.learning_mode(True)
 
 
+def back_off(r, poses):
+    """After the robot stopped itself: open the gripper, go straight up to the safe height, then rest."""
+    r.learning_mode(False)
+    r.open_gripper()
+    p = list(r.get_pose())
+    r.move_pose(p[:2] + [max(p[2], poses["z_safe"])] + p[3:])
+    rest(r)
+
+
 def run_steps(steps, poses, then_rest=False):
     """An action for while_busy(): send these recorded steps to the robot (motors on first)."""
     plan = PlanRecorder(poses)
@@ -357,7 +366,8 @@ def ask_step(picture, title, lines, allowed, hint):
     note = ""
     print(title)
     while True:
-        show_status(picture, title, lines + ([note] if note else []), ORANGE if note else BLUE, refresh=False)
+        show_status(picture, title, lines + (note.split("\n") if note else []), ORANGE if note else BLUE,
+                    refresh=False)
         key = cv2.waitKeyEx(50)
         if key == -1:
             continue
@@ -452,7 +462,7 @@ def guided_pick(recorder, robot, cube, poses, picture, target, which, square, le
                      "- Right height? Press ENTER: the gripper closes and carries the cube to the square, where it "
                      "stops again (step 4).", stop_line]
             allowed, hint = ("up", "down"), "Use the UP and DOWN arrows, then ENTER."
-        key = ask_step(picture, title, [route] + lines + ([note] if note else []), set(allowed) | {"enter", "esc"},
+        key = ask_step(picture, title, [route] + lines + (note.split("\n") if note else []), set(allowed) | {"enter", "esc"},
                        hint)
         note = ""
         if key == "esc":
@@ -465,6 +475,15 @@ def guided_pick(recorder, robot, cube, poses, picture, target, which, square, le
             stage += 1
             if stages[stage] == "height":                       # down to the grip height
                 note = go([xyz[0], xyz[1], down[2]], turn, "height")
+                if note == MOVE_REFUSED:                         # a finger landed on the cube: back up, step 1 again
+                    try:
+                        while_busy(run_steps([("move", pose())], poses), robot, picture, f"{which}: moving back up",
+                                   busy)
+                    except RuntimeError as e:
+                        print(f"  Move refused by the robot: {e}")
+                    stage = 0
+                    note = ("- The robot STOPPED on the way down: a finger landed on the cube. It went back up.\n"
+                            "  Move it over the MIDDLE of the cube again (W/A/S/D), then ENTER.")
             continue
         mm, deg = 0.001, 2.0                  # standing in front of the robot: towards you = +x, your right = +y
         new = list(xyz)
@@ -522,7 +541,7 @@ def guided_pick(recorder, robot, cube, poses, picture, target, which, square, le
                  f"- Lined up? Press ENTER: it goes down and lets go. Changes are saved for square {square}, every "
                  "level.",
                  "- Esc = no change: drop at the saved position."]
-        key = ask_step(picture, title, lines + ([note] if note else []),
+        key = ask_step(picture, title, lines + (note.split("\n") if note else []),
                        {"w", "a", "s", "d", "left", "right", "enter", "esc"},
                        "Use W, A, S, D to move, LEFT / RIGHT arrows to turn, then ENTER.")
         note = ""
@@ -610,8 +629,8 @@ def save_drop_turn(square, turn):
     DROP_TURN_FILE.write_text(json.dumps(turns, indent=2))
 
 
-MOVE_REFUSED = ("- The robot STOPPED: the gripper pressed on something (the cube or the platform), or the wrist "
-                "could not turn there. Move back (e.g. the UP arrow) and try smaller steps.")
+MOVE_REFUSED = ("- The robot STOPPED: the gripper pressed on something (the cube or the platform),\n"
+                "  or the wrist could not turn there. Move back (e.g. the UP arrow) and try smaller steps.")
 
 
 def save_drop_xy(square, level, xy, poses):
@@ -909,10 +928,25 @@ def main():
                     print("Guided pick not possible (no move down to the cube followed by close_gripper()): "
                           "normal pick")
             if result_ is None:
-                while_busy(run_steps(with_drop_turn(recorder.steps, square, level), poses, then_rest=True), robot,
-                           still, "Robot moving - keep clear",
-                           [target + "   " + turns, "Ctrl+C in the Run window = stop (power switch for an emergency)"]
-                           + (["Voice: words said while the robot moves are ignored"] if voice is not None else []))
+                try:
+                    while_busy(run_steps(with_drop_turn(recorder.steps, square, level), poses, then_rest=True),
+                               robot, still, "Robot moving - keep clear",
+                               [target + "   " + turns, "Ctrl+C in the Run window = stop (power switch for an emergency)"]
+                               + (["Voice: words said while the robot moves are ignored"] if voice is not None else []))
+                except RuntimeError as e:             # the robot stopped itself (e.g. the gripper pressed on the cube)
+                    print(f"The robot STOPPED during the pick: {e}")
+                    while_busy(lambda r: back_off(r, poses), robot, still, "Robot stopped - moving up",
+                               ["Opening the gripper, moving up and resting"])
+                    log.writerow([datetime.now().isoformat(timespec="seconds"), cube.label, round(cube.confidence, 3),
+                                  round(cube.x * 1000, 1), round(cube.y * 1000, 1), round(cube.angle_deg, 1),
+                                  square, level, "n", args.dry_run, cfg.USE_PARALLAX_CORRECTION, "",
+                                  "robot stopped", was_guided])
+                    log_file.flush()
+                    ask("Enter = carry on", False, live, "The robot STOPPED",
+                        ["- The gripper pressed on something (the cube or the platform), so the robot stopped.",
+                         "- Recorded as a failed pick (robot stopped). Check the cube, then press Enter."], RED,
+                        "\r", "Press Enter to carry on (click on the camera window first).")
+                    continue
             else:
                 guided_left -= 1
                 was_guided = True

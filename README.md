@@ -1,73 +1,94 @@
-# AI Vision Colour Sorting with the Niryo One – online simulator
+# AI Vision Colour Sorting with the Niryo One (complete version)
 
-The EEE-7-ROB AI vision colour sorting station in a web browser: Niryo One, platform with ArUco markers,
-squares A, B, C, foam cubes and the station camera. The project's Python programs run
-unchanged in the browser (Pyodide), with their OpenCV and Tk windows, keys, mouse clicks,
-robot commands and `input()`.
+**Lab guide (PDF):** `docs/AI_Vision_Colour_Sorting_Lab_Guide.pdf` (setup, safety, every step with questions, the report).
 
-## Publishing on GitHub Pages
+A camera finds coloured cubes in the pick zone, a trained classifier names their colour, and
+the Niryo One sorts red, yellow and green cubes onto squares A, B and C. **All the code is
+given.** Tasks: set it up, run every step on your station, measure the results against
+`SPECIFICATION.md`, and explain how each part works (the parts marked `KEY PART`).
+Before you start, read the lab risk assessment RA001650/2 (summarised in the lab guide).
 
-1. Create a repository (for example `roboticst411/VisionSortingSimulation`) and copy the
-   contents of this folder into it. Do **not** copy `vendor/` (local testing only) or
-   `project/staff.json` (it contains the answers).
-2. Settings → Pages → Deploy from branch → `main`, folder `/ (root)`.
-3. Open `https://<user>.github.io/<repository>/`. The first visit reloads once:
-   `coi-serviceworker.js` turns on cross-origin isolation, which Python needs to wait
-   for keys and robot moves (GitHub Pages cannot send those headers itself).
+## A. Setup (once, on the lab PC)
 
-Python (Pyodide 0.26.4 with OpenCV, scikit-learn, SciPy and matplotlib, about 60 MB) is
-loaded from the jsDelivr CDN on first use and cached by the browser.
+Open your PyCharm project from the labs (the one with `ApiTCP_Python_NiryoOne`), then open the
+**Terminal** tab at the bottom of PyCharm. The prompt must start with `(.venv)` (the project's
+virtual environment); if it does not, run `.venv\Scripts\activate`.
 
-## For students
+1. Robot client (skip if the folder `ApiTCP_Python_NiryoOne` is already in the project):
 
-Nothing to install: open the link in Chrome or Edge on a PC (Firefox works except voice).
-The first visit reloads once, then downloads Python (about 60 MB, cached afterwards).
-Files are kept in the student's own browser; download and upload them as a .zip.
+       git clone https://github.com/LSBU-Electronics-Lab/ApiTCP_Python_NiryoOne.git
 
-Labs 1 to 4 are included, each in its own folder (`LAB-1/main.py` … `LAB-4/main.py` in the
-Run list). Every robot address connects to the one simulated arm. Lab 4's `keyboard` module
-reads keys pressed on the page, except while typing in a text box.
+   In PyCharm, right-click that folder > Mark Directory as > Sources Root.
 
-## Updating the student files
+2. This project:
 
-The program files come from `project/student.json`, built from the VisionSortingMaster project folder:
+       git clone https://github.com/RoboticsT411/VisionSortingMaster.git
+       cd VisionSortingMaster
 
-    python build_site.py ../VisionSortingMaster
+   (Without git: unzip this folder into the project instead and `cd` into it.)
 
-`build_site.py` keeps Labs 1 to 4, takes every program file of the vision sorting project, appends the
-simulator's settings to `config.py` (robot "Simulator", 20 mm cubes, camera position, parallax height)
-and keeps `stations/simulator.json` (the simulated station's Lab 5 positions).
+3. Packages:
 
-When a student opens the page after an update, each file they have not changed is replaced by the new
-one; files they changed are kept. (Students who used the simulator before 26 Nov 2026 get the vision
-sorting program files replaced once, and their old `calibration` folder is renamed
-`calibration_before_update`, because the marker layout changed.)
+       pip install -r requirements.txt
 
-## Testing locally
+4. Settings: open `config.py` and set `CUBE_SIZE_MM` to your cubes' side length.
 
-    python serve.py site 8765       # serves with the cross-origin isolation headers
-                                    # (from inside the unzipped site: python serve.py . 8765)
-    open http://127.0.0.1:8765/index.html            (student files)
-    open http://127.0.0.1:8765/index.html?pkg=staff  (staff files)
+5. Check:
 
-With a local `vendor/pyodide/` folder (the Pyodide 0.26.4 release unpacked), Python is
-loaded from it on 127.0.0.1; add `?cdn` to use jsDelivr instead.
+       python progress.py
 
-## Files
+   It prints the progress list with nothing ticked.
 
-| File | Purpose |
-|---|---|
-| `index.html` | Page layout and help |
-| `app.js` | Connects Python, the station and the windows; Run/Stop, terminal, editor, files, voice |
-| `scene.js` | 3D station, gripper, grasping and stacking, station camera |
-| `arm.js` | Niryo One: Niryo's joint chain, inverse kinematics, link and Gripper 1 meshes |
-| `ui.js` | OpenCV windows, Tk windows, message boxes |
-| `real.js` | Real robot and camera (in the lab): shadow of a real Niryo One through its rosbridge (port 9090, read only), USB camera for the programs |
-| `worker.js` | Runs Python; blocking calls through shared memory; copies and updates the student's files |
-| `build_site.py` | Builds `project/student.json` from the VisionSortingMaster folder |
-| `py/` | Python stand-ins: camera and windows (`browser_cv2.py`), robot client (`niryo_one_tcp_client.py`), Tk (`tkinter/`), voice (`voice_commands.py`), start-up (`browser_boot.py`) |
-| `lib/` | three.js, OrbitControls, BufferGeometryUtils, fflate; `lib/niryo/` the Niryo One meshes |
+Optional, voice commands: `pip install vosk sounddevice`, unzip a Vosk English model
+(e.g. `vosk-model-small-en-us-0.15`) next to `voice_commands.py`, test with `python voice_commands.py`.
 
-## Credits
+## B. Order to run
 
-Niryo One kinematics and meshes: [NiryoRobotics/niryo_one_ros](https://github.com/NiryoRobotics/niryo_one_ros) and [niryo_one](https://github.com/NiryoRobotics/niryo_one), GPL-3.0. The same arm is used in the Niryo One browser simulator.
+Run these one after another from the project folder. A window shows what to do next and which
+key to press: click the window once before pressing a key; `Q` quits. `python progress.py`
+shows what is done at any time. Results go to `results/`.
+
+| # | Command | What you do |
+| --- | --- | --- |
+| 1 | `python step1_lab5_positions.py` | Choose your robot; type the gripper orientation and the Lab 5 pick-up and drop positions for A, B, C at levels 1, 2, 3; test each; save |
+| 2 | `python step1_tune_camera.py` | Click the picture, `A` auto-tune, `S` save, `Q` quit |
+| 3 | `python mapping.py` | Self-test of the camera-to-robot mapping (prints OK) |
+| 4 | `python step1_check_calibration.py` | Follow the checklist (4 ticks for A, B, C): click the centres of A, B, C; check each square with the robot (T, centre the gripper, Y: circles refit automatically); click A, B, C again to confirm, all within 5 mm. Then the ruler checks (R7) |
+| 5 | `python step2_collect_data.py` | `B` saves the empty background; then one colour per scene, its number key (`1` red ... `8` white, `0` other). Minimum 30 images in 5 scenes for red, yellow, green, other |
+| 6 | `python step2_collect_data.py --dataset dataset_lighting2` | A small second set in clearly different lighting (about 10 images per class) |
+| 7 | `python step3_train.py` | Compares the models, chooses one, tests it once |
+| 8 | `python step3_baseline_hsv.py --train` | Tunes the colour rule on the training images |
+| 9 | `python step3_baseline_hsv.py` | Tests the colour rule (once) |
+| 10 | `python step3_live_detect.py` | Live colours and confidence; `S` saves a screenshot. The robot does not move |
+| 11 | `python step3_experiments.py` | Learning curve, leakage test, threshold curve, lighting shift |
+| 12 | `python step4_sort_blocks.py --measure-offset` | Sorting with the robot; confirm each move with a key. First 5 picks guided, then at least 20 picks |
+| 13 | `python trials_summary.py` | Your trials against the specification, with 95 % intervals |
+
+Optional: `python explore_kmeans.py` (unsupervised k-means on your dataset),
+`python test_wrist_turn.py` (checks the gripper turns the right way), step 4 with `--voice`.
+
+**Safety (risk assessment RA001650/2):** keep at least 30 cm from the robot while it is powered
+(also when checking the gripper), only the technician moves the arm by hand or connects power,
+one PC per robot, and confirm a move only when nothing is in the way. To stop: `Q` (or `Esc`
+in a guided pick), `Ctrl+C` in the terminal, or switch off the robot's power.
+
+## C. Key parts to study and explain
+
+| Step | File | Key part | What it does |
+| --- | --- | --- | --- |
+| 3 | `mapping.py` | `compute_homography()`, `apply_homography()`, `mapping_errors_mm()` | Camera pixel to robot x, y from the four markers |
+| opt. | `mapping.py` | `correct_parallax()` | Corrects the cube-top position for the camera angle |
+| 7 | `step3_train.py` | `candidate_models()`, `compare_and_choose()` | Models tried; train, measure, choose on validation |
+| 8-9 | `step3_baseline_hsv.py` | `classify()` | A colour rule with no learning, to compare with the model |
+| 11 | `step3_experiments.py` | the four experiments | Evidence about the model |
+| 12 | `step4_sort_blocks.py` | `choose()`, `pick_and_drop()` | Which cube next; the robot moves (from the Lab 5 program) |
+
+Other files: `config.py` (all settings; the only file you need to edit), `camera.py`,
+`aruco_view.py`, `block_finder.py`, `colour_model.py`, `vision.py`, `robot.py`, `ui.py`,
+`progress.py`, `voice_commands.py`.
+
+## D. Updates
+
+Staff may update the project during the term. Inside the project folder run:
+
+    git pull
